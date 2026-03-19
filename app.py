@@ -118,9 +118,17 @@ def stop_job(job_id):
     if job_id not in active_jobs: return jsonify({"error": "Job not found"}), 404
     job = active_jobs[job_id]
     if job.get("process"):
-        try: job["process"].terminate(); job["status"]="stopped"
+        try: job["process"].terminate()
         except: pass
-    return jsonify({"status": "stopped"})
+    # Delete file from server storage
+    if job.get("file") and os.path.exists(job["file"]):
+        try:
+            os.remove(job["file"])
+            logger.info(f"Deleted file for job {job_id} after download")
+        except Exception as e:
+            logger.warning(f"Could not delete file: {e}")
+    del active_jobs[job_id]
+    return jsonify({"status": "deleted"})
 
 def monitor_loop():
     global monitoring_active
