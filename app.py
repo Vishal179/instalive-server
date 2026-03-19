@@ -15,15 +15,11 @@ def send_notification(title, message, priority="high", tags="movie_camera"):
     try:
         requests.post(NTFY_URL,
             data=message.encode("utf-8"),
-            headers={
-                "Title": title,
-                "Priority": priority,
-                "Tags": tags,
-                "Content-Type": "text/plain"
-            }, timeout=10)
-        logger.info(f"Notification sent: {title}")
+            headers={"Title": title, "Priority": priority, "Tags": tags},
+            timeout=10)
+        logger.info(f"Ntfy sent: {title}")
     except Exception as e:
-        logger.error(f"Notification failed: {e}")
+        logger.error(f"Ntfy failed: {e}")
 
 @app.route("/", methods=["GET"])
 def health():
@@ -37,16 +33,21 @@ def start_recording():
     username = data.get("username")
     cookie = data.get("cookie")
     from_start = data.get("from_start", True)
-    if not username or not cookie: return jsonify({"error": "username and cookie required"}), 400
+    if not username or not cookie:
+        return jsonify({"error": "username and cookie required"}), 400
+    # Check if already recording
     for jid, job in active_jobs.items():
-        if job["username"]==username and job["status"]=="recording":
+        if job["username"]==username and job["status"] in ["recording","starting"]:
             return jsonify({"job_id": jid, "status": "already_recording"})
     job_id = str(uuid.uuid4())[:8]
     thread = threading.Thread(target=record_live, args=(job_id, username, cookie, from_start))
     thread.daemon = True
     thread.start()
-    active_jobs[job_id] = {"status": "starting", "username": username,
-                           "started_at": time.time(), "file": None, "error": None, "process": None}
+    active_jobs[job_id] = {
+        "status": "starting", "username": username,
+        "started_at": time.time(), "file": None,
+        "error": None, "process": None
+    }
     logger.info(f"Started job {job_id} for @{username}")
     return jsonify({"job_id": job_id, "status": "started"})
 
@@ -59,14 +60,14 @@ def start_monitoring():
     cookie = data.get("cookie")
     if not account_id or not cookie:
         return jsonify({"error": "account_id and cookie required"}), 400
-    monitored_accounts[account_id] = {"cookie": cookie, "last_check": 0}
+    monitored_accounts[account_id] = {"cookie": cookie}
     if not monitoring_active:
         monitoring_active = True
         t = threading.Thread(target=monitor_loop)
         t.daemon = True
         t.start()
         logger.info("Monitoring started")
-        send_notification("InstaLive Server", "Monitoring started for your accounts", priority="low", tags="eyes")
+        send_notification("InstaLive Server", "24/7 monitoring active!", priority="low", tags="eyes")
     return jsonify({"status": "monitoring", "accounts": len(monitored_accounts)})
 
 @app.route("/monitor/stop", methods=["POST"])
@@ -90,7 +91,8 @@ def monitor_status():
 
 @app.route("/status/<job_id>", methods=["GET"])
 def job_status(job_id):
-    if job_id not in active_jobs: return jsonify({"error": "Job not found"}), 404
+    if job_id not in active_jobs:
+        return jsonify({"error": "Job not found"}), 404
     job = active_jobs[job_id]
     response = {"job_id": job_id, "status": job["status"],
                 "username": job["username"], "error": job["error"]}
@@ -101,32 +103,35 @@ def job_status(job_id):
 
 @app.route("/jobs", methods=["GET"])
 def list_jobs():
-    return jsonify({"jobs": [{"job_id": jid, "username": j["username"],
-                              "status": j["status"]} for jid,j in active_jobs.items()]})
+    return jsonify({"jobs": [
+        {"job_id": jid, "username": j["username"], "status": j["status"]}
+        for jid,j in active_jobs.items()
+    ]})
 
 @app.route("/download/<job_id>", methods=["GET"])
 def download_file(job_id):
-    if job_id not in active_jobs: return jsonify({"error": "Job not found"}), 404
+    if job_id not in active_jobs:
+        return jsonify({"error": "Job not found"}), 404
     job = active_jobs[job_id]
-    if job["status"]!="done": return jsonify({"error": "Not finished", "status": job["status"]}), 202
-    if not job["file"] or not os.path.exists(job["file"]): return jsonify({"error": "File not found"}), 404
+    if job["status"]!="done":
+        return jsonify({"error": "Not finished", "status": job["status"]}), 202
+    if not job["file"] or not os.path.exists(job["file"]):
+        return jsonify({"error": "File not found"}), 404
     return send_file(job["file"], as_attachment=True,
-                     download_name=f"{job['username']}_live.mp4", mimetype="video/mp4")
+                     download_name=f"{job['username']}_live.mp4",
+                     mimetype="video/mp4")
 
 @app.route("/stop/<job_id>", methods=["POST"])
 def stop_job(job_id):
-    if job_id not in active_jobs: return jsonify({"error": "Job not found"}), 404
+    if job_id not in active_jobs:
+        return jsonify({"error": "Job not found"}), 404
     job = active_jobs[job_id]
     if job.get("process"):
         try: job["process"].terminate()
         except: pass
-    # Delete file from server storage
     if job.get("file") and os.path.exists(job["file"]):
-        try:
-            os.remove(job["file"])
-            logger.info(f"Deleted file for job {job_id} after download")
-        except Exception as e:
-            logger.warning(f"Could not delete file: {e}")
+        try: os.remove(job["file"])
+        except: pass
     del active_jobs[job_id]
     return jsonify({"status": "deleted"})
 
@@ -138,10 +143,9 @@ def monitor_loop():
             try:
                 check_account_for_live(account_id, account["cookie"])
             except Exception as e:
-                logger.error(f"Monitor error for {account_id}: {e}")
+                logger.error(f"Monitor error: {e}")
         time.sleep(30)
     monitoring_active = False
-    logger.info("Monitor loop stopped")
 
 def check_account_for_live(account_id, cookie):
     try:
@@ -153,10 +157,9 @@ def check_account_for_live(account_id, cookie):
         resp = requests.get("https://i.instagram.com/api/v1/feed/reels_tray/",
                            headers=headers, timeout=15)
         if resp.status_code != 200:
-            logger.warning(f"Reels tray {resp.status_code} for {account_id}")
+            logger.warning(f"Reels tray {resp.status_code}")
             return
-        data = resp.json()
-        tray = data.get("tray", [])
+        tray = resp.json().get("tray", [])
         for item in tray:
             broadcast = item.get("broadcast")
             if not broadcast: continue
@@ -166,16 +169,13 @@ def check_account_for_live(account_id, cookie):
             already = any(j["username"]==username and j["status"] in ["recording","starting"]
                          for j in active_jobs.values())
             if already: continue
-            viewer_count = broadcast.get("viewer_count", 0)
-            logger.info(f"LIVE: @{username} viewers={viewer_count}")
-            # Send notification immediately
+            viewers = broadcast.get("viewer_count", 0)
+            logger.info(f"LIVE DETECTED: @{username} viewers={viewers}")
             send_notification(
                 f"🔴 @{username} is LIVE!",
-                f"Recording started automatically\n👥 {viewer_count} viewers watching",
-                priority="urgent",
-                tags="red_circle,movie_camera"
+                f"Auto-recording started!\n👥 {viewers} viewers",
+                priority="urgent", tags="red_circle,movie_camera"
             )
-            # Start recording immediately
             job_id = str(uuid.uuid4())[:8]
             t = threading.Thread(target=record_live, args=(job_id, username, cookie, True))
             t.daemon = True
@@ -183,52 +183,101 @@ def check_account_for_live(account_id, cookie):
             active_jobs[job_id] = {
                 "status": "starting", "username": username,
                 "started_at": time.time(), "file": None,
-                "error": None, "process": None, "detected_by": "monitor"
+                "error": None, "process": None
             }
-            logger.info(f"Auto-started job {job_id} for @{username}")
     except Exception as e:
-        logger.error(f"check_account_for_live error: {e}")
+        logger.error(f"check_account error: {e}")
 
 def record_live(job_id, username, cookie, from_start=True):
     output_file = os.path.join(RECORDINGS_DIR, f"{job_id}_{username}.mp4")
     active_jobs[job_id]["status"] = "recording"
     active_jobs[job_id]["file"] = output_file
+    success = False
+    # Try yt-dlp first
     try:
-        cmd = ["yt-dlp",
-               "--add-header", f"Cookie:{cookie}",
-               "--add-header", "User-Agent:Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/105.0 Mobile Safari/537.36",
-               "--add-header", "X-IG-App-ID:936619743392459",
-               "-f", "best", "-o", output_file,
-               "--no-part", "--retries", "10", "--fragment-retries", "10"]
-        if from_start: cmd.append("--live-from-start")
+        logger.info(f"Job {job_id}: Trying yt-dlp for @{username}")
+        cmd = [
+            "yt-dlp",
+            "--add-header", f"Cookie:{cookie}",
+            "--add-header", "User-Agent:Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/105.0 Mobile Safari/537.36",
+            "--add-header", "X-IG-App-ID:936619743392459",
+            "-f", "best",
+            "-o", output_file,
+            "--no-part",
+            "--retries", "10",
+            "--fragment-retries", "10",
+            "--extractor-retries", "5",
+        ]
+        if from_start:
+            cmd.append("--live-from-start")
         cmd.append(f"https://www.instagram.com/{username}/live/")
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
         active_jobs[job_id]["process"] = process
         for line in process.stdout:
-            if line.strip(): logger.info(f"[{job_id}] {line.strip()}")
+            if line.strip():
+                logger.info(f"[{job_id}] {line.strip()}")
         process.wait()
-        if process.returncode==0 and os.path.exists(output_file) and os.path.getsize(output_file)>0:
-            active_jobs[job_id]["status"] = "done"
-            size_mb = os.path.getsize(output_file) / (1024*1024)
-            # Notify recording done
-            send_notification(
-                f"✅ @{username} recording saved!",
-                f"Live recording complete\n📁 Size: {size_mb:.1f} MB\nOpen app to download",
-                priority="high",
-                tags="white_check_mark,floppy_disk"
-            )
-        else:
-            active_jobs[job_id]["status"] = "failed"
-            active_jobs[job_id]["error"] = f"Exit code {process.returncode}"
-            send_notification(
-                f"⚠️ Recording failed - @{username}",
-                f"Could not record live. Live may have ended too quickly.",
-                priority="default",
-                tags="warning"
-            )
+        if (process.returncode==0 and os.path.exists(output_file)
+                and os.path.getsize(output_file) > 10240):
+            success = True
+            logger.info(f"yt-dlp succeeded for @{username}")
     except Exception as e:
+        logger.error(f"yt-dlp error: {e}")
+    # If yt-dlp failed try with sessionid cookie only
+    if not success:
+        try:
+            logger.info(f"Job {job_id}: Retrying with sessionid only for @{username}")
+            # Extract just sessionid from cookie
+            sessionid = ""
+            for part in cookie.split(";"):
+                if "sessionid=" in part:
+                    sessionid = part.strip()
+                    break
+            if sessionid:
+                output_file2 = output_file.replace(".mp4", "_retry.mp4")
+                cmd2 = [
+                    "yt-dlp",
+                    "--add-header", f"Cookie:{sessionid}",
+                    "--add-header", "User-Agent:Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/105.0 Mobile Safari/537.36",
+                    "-f", "best",
+                    "-o", output_file2,
+                    "--no-part",
+                    "--retries", "5",
+                    f"https://www.instagram.com/{username}/live/"
+                ]
+                process2 = subprocess.Popen(cmd2, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True)
+                active_jobs[job_id]["process"] = process2
+                for line in process2.stdout:
+                    if line.strip(): logger.info(f"[{job_id}_retry] {line.strip()}")
+                process2.wait()
+                if (process2.returncode==0 and os.path.exists(output_file2)
+                        and os.path.getsize(output_file2) > 10240):
+                    output_file = output_file2
+                    active_jobs[job_id]["file"] = output_file
+                    success = True
+                    logger.info(f"Retry succeeded for @{username}")
+        except Exception as e:
+            logger.error(f"Retry error: {e}")
+    if success:
+        active_jobs[job_id]["status"] = "done"
+        size_mb = os.path.getsize(output_file) / (1024*1024)
+        send_notification(
+            f"✅ @{username} recorded!",
+            f"Recording complete!\n📁 {size_mb:.1f} MB\nOpen app to download",
+            priority="high", tags="white_check_mark"
+        )
+        logger.info(f"Job {job_id} done: {size_mb:.1f} MB")
+    else:
         active_jobs[job_id]["status"] = "failed"
-        active_jobs[job_id]["error"] = str(e)
+        active_jobs[job_id]["error"] = "All recording attempts failed. Cookie may be expired."
+        send_notification(
+            f"⚠️ Failed - @{username}",
+            "Recording failed. Please refresh your Instagram login in the app.",
+            priority="default", tags="warning"
+        )
+        logger.error(f"Job {job_id} failed for @{username}")
     threading.Timer(3600, lambda: cleanup_job(job_id)).start()
 
 def cleanup_job(job_id):
