@@ -6,6 +6,31 @@ logger = logging.getLogger(__name__)
 RECORDINGS_DIR = "/tmp/recordings"
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 active_jobs = {}
+JOBS_FILE = "/tmp/jobs.json"
+
+def save_jobs():
+    try:
+        import json
+        # Only save non-process data
+        saveable = {}
+        for jid, job in active_jobs.items():
+            saveable[jid] = {k:v for k,v in job.items() if k != "process"}
+        with open(JOBS_FILE, "w") as f:
+            json.dump(saveable, f)
+    except Exception as e:
+        logger.warning(f"save_jobs error: {e}")
+
+def load_jobs():
+    try:
+        import json
+        if os.path.exists(JOBS_FILE):
+            with open(JOBS_FILE) as f:
+                return json.load(f)
+    except: pass
+    return {}
+
+# Load existing jobs on startup
+active_jobs.update(load_jobs())
 monitored_accounts = {}
 monitoring_active = False
 NTFY_TOPIC = "Inslive-jhwalker"
@@ -191,6 +216,7 @@ def check_account_for_live(account_id, cookie):
 def record_live(job_id, username, cookie, from_start=True):
     output_file = os.path.join(RECORDINGS_DIR, f"{job_id}_{username}.mp4")
     active_jobs[job_id]["status"] = "recording"
+    save_jobs()
     active_jobs[job_id]["file"] = output_file
     success = False
     # Try yt-dlp first
@@ -262,6 +288,7 @@ def record_live(job_id, username, cookie, from_start=True):
             logger.error(f"Retry error: {e}")
     if success:
         active_jobs[job_id]["status"] = "done"
+        save_jobs()
         size_mb = os.path.getsize(output_file) / (1024*1024)
         send_notification(
             f"✅ @{username} recorded!",
@@ -271,6 +298,7 @@ def record_live(job_id, username, cookie, from_start=True):
         logger.info(f"Job {job_id} done: {size_mb:.1f} MB")
     else:
         active_jobs[job_id]["status"] = "failed"
+        save_jobs()
         active_jobs[job_id]["error"] = "All recording attempts failed. Cookie may be expired."
         send_notification(
             f"⚠️ Failed - @{username}",
