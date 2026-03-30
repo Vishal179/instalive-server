@@ -1,3 +1,4 @@
+import random
 from flask import Flask, request, jsonify, send_file
 import subprocess, os, threading, uuid, time, logging, requests
 app = Flask(__name__)
@@ -169,7 +170,7 @@ def monitor_loop():
                 check_account_for_live(account_id, account["cookie"])
             except Exception as e:
                 logger.error(f"Monitor error: {e}")
-        time.sleep(30)
+        time.sleep(60)
     monitoring_active = False
 
 def check_account_for_live(account_id, cookie):
