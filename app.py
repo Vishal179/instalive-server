@@ -450,6 +450,180 @@ def discover_lives():
     return jsonify({"lives":lives,"count":len(lives)})
 
 
+
+# Brazil coordinates for major cities
+BRAZIL_CITIES = [
+    {"name": "São Paulo",    "lat": -23.5505, "lng": -46.6333},
+    {"name": "Rio de Janeiro","lat": -22.9068, "lng": -43.1729},
+    {"name": "Brasília",     "lat": -15.7975, "lng": -47.8919},
+    {"name": "Salvador",     "lat": -12.9714, "lng": -38.5014},
+    {"name": "Fortaleza",    "lat": -3.7172,  "lng": -38.5433},
+    {"name": "Belo Horizonte","lat": -19.9191, "lng": -43.9386},
+    {"name": "Manaus",       "lat": -3.1190,  "lng": -60.0217},
+    {"name": "Curitiba",     "lat": -25.4290, "lng": -49.2671},
+    {"name": "Recife",       "lat": -8.0476,  "lng": -34.8770},
+    {"name": "Porto Alegre", "lat": -30.0346, "lng": -51.2177},
+]
+
+@app.route("/discover/brazil", methods=["POST"])
+def discover_brazil_lives():
+    """Discover lives from Brazil using location-based search"""
+    data = request.json
+    if not data: return jsonify({"error":"No data"}),400
+    cookie = data.get("cookie","")
+    if not cookie: return jsonify({"error":"cookie required"}),400
+
+    ua = "Instagram/269.0.0.18.75 Android (28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom; en_US; 567067343352427)"
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": ua,
+        "X-IG-App-ID": "567067343352427",
+        "X-IG-Capabilities": "3brTvwE=",
+        "X-IG-Connection-Type": "WIFI",
+        "X-FB-HTTP-Engine": "Liger",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+        "Accept": "*/*"
+    }
+
+    lives = []
+    seen_users = set()
+    seen_locations = set()
+
+    def add_live(username, full_name, pic, viewers, thumb, city):
+        if username and username not in seen_users:
+            seen_users.add(username)
+            lives.append({
+                "username": username,
+                "full_name": full_name,
+                "profile_pic": pic,
+                "viewers": viewers,
+                "thumbnail": thumb,
+                "source": f"Brazil - {city}"
+            })
+
+    # Step 1: Search location IDs for each Brazilian city
+    location_ids = []
+    for city in BRAZIL_CITIES:
+        try:
+            params = {
+                "lat": city["lat"],
+                "lng": city["lng"],
+                "count": 20,
+                "query": city["name"]
+            }
+            r = requests.get(
+                "https://i.instagram.com/api/v1/fbsearch/places/",
+                headers=headers, params=params, timeout=10)
+            logger.info(f"Places {city['name']}: {r.status_code}")
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                for item in items[:5]:  # Top 5 locations per city
+                    loc = item.get("location", {})
+                    loc_id = loc.get("pk") or loc.get("facebook_places_id")
+                    if loc_id and loc_id not in seen_locations:
+                        seen_locations.add(loc_id)
+                        location_ids.append({
+                            "id": loc_id,
+                            "city": city["name"]
+                        })
+            time.sleep(0.5)  # Rate limit
+        except Exception as e:
+            logger.error(f"Places search {city['name']}: {e}")
+
+    logger.info(f"Found {len(location_ids)} location IDs")
+
+    # Step 2: Check each location for active live stories
+    for loc in location_ids[:30]:  # Max 30 locations
+        try:
+            r = requests.get(
+                f"https://i.instagram.com/api/v1/locations/{loc['id']}/story/",
+                headers=headers, timeout=10)
+            if r.status_code == 200:
+                data_j = r.json()
+                # Check for live broadcast
+                broadcast = data_j.get("broadcast")
+                if broadcast:
+                    owner = broadcast.get("broadcast_owner", {})
+                    username = owner.get("username", "")
+                    if username:
+                        add_live(
+                            username,
+                            owner.get("full_name", ""),
+                            owner.get("profile_pic_url", ""),
+                            broadcast.get("viewer_count", 0),
+                            broadcast.get("cover_frame_url", ""),
+                            loc["city"]
+                        )
+                # Check reels in location
+                reels = data_j.get("reels", {})
+                for reel_id, reel in reels.items():
+                    b = reel.get("broadcast")
+                    if b:
+                        u = reel.get("user", {})
+                        if u.get("username"):
+                            add_live(
+                                u["username"],
+                                u.get("full_name",""),
+                                u.get("profile_pic_url",""),
+                                b.get("viewer_count",0),
+                                b.get("cover_frame_url",""),
+                                loc["city"]
+                            )
+            time.sleep(0.3)
+        except Exception as e:
+            logger.error(f"Location story {loc['id']}: {e}")
+
+    # Step 3: Also search by Brazilian hashtags to find live users
+    brazil_tags = ["brasil", "brazil", "saopaulo", "riodejaneiro",
+                   "brasileiros", "brazilians"]
+    for tag in brazil_tags[:3]:
+        try:
+            r = requests.get(
+                f"https://i.instagram.com/api/v1/feed/tag/{tag}/?count=20",
+                headers=headers, timeout=10)
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                # Get unique users from recent posts
+                tag_users = []
+                for item in items[:10]:
+                    user = item.get("user", {})
+                    uid = user.get("pk")
+                    uname = user.get("username","")
+                    if uid and uname and uname not in seen_users:
+                        tag_users.append({"id":uid,"username":uname})
+                # Check if any are live
+                if tag_users:
+                    user_ids = ",".join([str(u["id"]) for u in tag_users[:10]])
+                    r2 = requests.get(
+                        f"https://i.instagram.com/api/v1/feed/reels_media/?reel_ids={user_ids}",
+                        headers=headers, timeout=10)
+                    if r2.status_code == 200:
+                        reels = r2.json().get("reels", {})
+                        for uid, reel in reels.items():
+                            b = reel.get("broadcast")
+                            if b:
+                                u = reel.get("user",{})
+                                add_live(
+                                    u.get("username",""),
+                                    u.get("full_name",""),
+                                    u.get("profile_pic_url",""),
+                                    b.get("viewer_count",0),
+                                    b.get("cover_frame_url",""),
+                                    "Brazil (hashtag)"
+                                )
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Hashtag {tag}: {e}")
+
+    lives.sort(key=lambda x: x.get("viewers",0), reverse=True)
+    logger.info(f"Brazil lives found: {len(lives)}")
+    return jsonify({
+        "lives": lives,
+        "count": len(lives),
+        "locations_checked": len(location_ids)
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
