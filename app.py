@@ -318,96 +318,137 @@ def cleanup_job(job_id):
         del active_jobs[job_id]
 
 
+
 @app.route("/discover", methods=["POST"])
 def discover_lives():
-    """Get all live streams - aggregated from multiple endpoints"""
     data = request.json
-    if not data: return jsonify({"error": "No data"}), 400
-    cookie = data.get("cookie")
-    if not cookie: return jsonify({"error": "cookie required"}), 400
+    if not data: return jsonify({"error":"No data"}),400
+    cookie = data.get("cookie","")
+    if not cookie: return jsonify({"error":"cookie required"}),400
 
     lives = []
     seen = set()
+
+    versions = ["269.0.0.18.75","264.0.0.19.102","261.0.0.21.111"]
+    devices = [
+        "28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom",
+        "29/10; 440dpi; 1080x2340; OnePlus; IN2023; OnePlus8T; qcom",
+        "30/11; 480dpi; 1080x2400; Xiaomi; M2007J3SG; apollo; qcom"
+    ]
+    idx = random.randint(0,len(versions)-1)
     headers = {
         "Cookie": cookie,
-        "User-Agent": "Instagram 269.0.0.18.75 Android (28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom; en_US; 567067343352427)",
+        "User-Agent": f"Instagram/{versions[idx]} Android ({devices[idx]}; en_US; 567067343352427)",
         "X-IG-App-ID": "567067343352427",
         "X-IG-Capabilities": "3brTvwE=",
         "X-IG-Connection-Type": "WIFI",
+        "X-FB-HTTP-Engine": "Liger",
         "Accept-Language": "en-US",
         "Accept": "*/*"
     }
 
-    # Endpoint 1: Top live (discover page)
-    endpoints = [
-        "https://i.instagram.com/api/v1/discover/top_live/",
-        "https://i.instagram.com/api/v1/live/get_live_checklists/",
-        "https://i.instagram.com/api/v1/feed/reels_tray/"
-    ]
+    def add_live(username, full_name, pic, viewers, thumb, source):
+        if username and username not in seen:
+            seen.add(username)
+            lives.append({
+                "username": username,
+                "full_name": full_name,
+                "profile_pic": pic,
+                "viewers": viewers,
+                "thumbnail": thumb,
+                "source": source
+            })
 
-    for endpoint in endpoints:
-        try:
-            resp = requests.get(endpoint, headers=headers, timeout=15)
-            logger.info(f"Discover {endpoint}: {resp.status_code}")
-            if resp.status_code != 200:
-                continue
-            data_json = resp.json()
+    # 1. Reels tray (followed accounts)
+    try:
+        r = requests.get(
+            "https://i.instagram.com/api/v1/feed/reels_tray/",
+            headers=headers, timeout=15)
+        if r.status_code == 200:
+            for item in r.json().get("tray",[]):
+                b = item.get("broadcast")
+                u = item.get("user",{})
+                if b and u.get("username"):
+                    add_live(u["username"],u.get("full_name",""),
+                        u.get("profile_pic_url",""),
+                        b.get("viewer_count",0),
+                        b.get("cover_frame_url",""),"following")
+    except Exception as e:
+        logger.error(f"reels_tray: {e}")
 
-            # Parse ranked_items (top_live)
-            for item in data_json.get("ranked_items", []):
-                broadcast = item.get("broadcast") or item
-                user = broadcast.get("broadcast_owner") or item.get("user", {})
-                username = user.get("username", "")
-                if username and username not in seen:
-                    seen.add(username)
-                    lives.append({
-                        "username": username,
-                        "full_name": user.get("full_name", ""),
-                        "profile_pic": user.get("profile_pic_url", ""),
-                        "viewers": broadcast.get("viewer_count", 0),
-                        "thumbnail": broadcast.get("cover_frame_url", ""),
-                        "source": "top_live"
-                    })
+    # 2. Top live (personalized explore)
+    try:
+        r = requests.get(
+            "https://i.instagram.com/api/v1/discover/top_live/",
+            headers=headers, timeout=15)
+        logger.info(f"top_live status: {r.status_code}")
+        if r.status_code == 200:
+            data_j = r.json()
+            # ranked_items format
+            for item in data_j.get("ranked_items",[]):
+                b = item.get("broadcast") or item
+                u = b.get("broadcast_owner") or item.get("user",{})
+                if u.get("username"):
+                    add_live(u["username"],u.get("full_name",""),
+                        u.get("profile_pic_url",""),
+                        b.get("viewer_count",0),
+                        b.get("cover_frame_url",""),"explore")
+            # items format
+            for item in data_j.get("items",[]):
+                b = item.get("broadcast")
+                u = item.get("user",{})
+                if b and u.get("username"):
+                    add_live(u["username"],u.get("full_name",""),
+                        u.get("profile_pic_url",""),
+                        b.get("viewer_count",0),
+                        b.get("cover_frame_url",""),"explore")
+    except Exception as e:
+        logger.error(f"top_live: {e}")
 
-            # Parse items array
-            for item in data_json.get("items", []):
-                broadcast = item.get("broadcast")
-                if not broadcast: continue
-                user = item.get("user", {})
-                username = user.get("username", "")
-                if username and username not in seen:
-                    seen.add(username)
-                    lives.append({
-                        "username": username,
-                        "full_name": user.get("full_name", ""),
-                        "profile_pic": user.get("profile_pic_url", ""),
-                        "viewers": broadcast.get("viewer_count", 0),
-                        "thumbnail": broadcast.get("cover_frame_url", ""),
-                        "source": "items"
-                    })
+    # 3. Live checklists
+    try:
+        r = requests.get(
+            "https://i.instagram.com/api/v1/live/get_live_checklists/",
+            headers=headers, timeout=15)
+        logger.info(f"checklists status: {r.status_code}")
+        if r.status_code == 200:
+            data_j = r.json()
+            for item in data_j.get("items",[]):
+                b = item.get("broadcast") or item
+                u = b.get("broadcast_owner") or item.get("user",{})
+                if u.get("username"):
+                    add_live(u["username"],u.get("full_name",""),
+                        u.get("profile_pic_url",""),
+                        b.get("viewer_count",0),
+                        b.get("cover_frame_url",""),"suggested")
+    except Exception as e:
+        logger.error(f"checklists: {e}")
 
-            # Parse tray (reels_tray)
-            for item in data_json.get("tray", []):
-                broadcast = item.get("broadcast")
-                if not broadcast: continue
-                user = item.get("user", {})
-                username = user.get("username", "")
-                if username and username not in seen:
-                    seen.add(username)
-                    lives.append({
-                        "username": username,
-                        "full_name": user.get("full_name", ""),
-                        "profile_pic": user.get("profile_pic_url", ""),
-                        "viewers": broadcast.get("viewer_count", 0),
-                        "thumbnail": broadcast.get("cover_frame_url", ""),
-                        "source": "reels_tray"
-                    })
-        except Exception as e:
-            logger.error(f"Discover error {endpoint}: {e}")
+    # 4. Scrape Instagram web explore for lives
+    try:
+        web_headers = {
+            "Cookie": cookie,
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": "567067343352427"
+        }
+        r = requests.get(
+            "https://www.instagram.com/explore/",
+            headers=web_headers, timeout=15)
+        if r.status_code == 200 and "broadcast" in r.text:
+            # Extract broadcast data from page HTML
+            import re
+            broadcasts = re.findall(
+                r'"broadcast":\{"([^}]+)\}', r.text)
+            logger.info(f"Web explore broadcasts: {len(broadcasts)}")
+    except Exception as e:
+        logger.error(f"web explore: {e}")
 
-    # Sort by viewer count
-    lives.sort(key=lambda x: x.get("viewers", 0), reverse=True)
-    return jsonify({"lives": lives, "count": len(lives)})
+    lives.sort(key=lambda x: x.get("viewers",0), reverse=True)
+    logger.info(f"Total lives found: {len(lives)}")
+    return jsonify({"lives":lives,"count":len(lives)})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
