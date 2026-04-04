@@ -317,6 +317,98 @@ def cleanup_job(job_id):
             except: pass
         del active_jobs[job_id]
 
+
+@app.route("/discover", methods=["POST"])
+def discover_lives():
+    """Get all live streams - aggregated from multiple endpoints"""
+    data = request.json
+    if not data: return jsonify({"error": "No data"}), 400
+    cookie = data.get("cookie")
+    if not cookie: return jsonify({"error": "cookie required"}), 400
+
+    lives = []
+    seen = set()
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Instagram 269.0.0.18.75 Android (28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom; en_US; 567067343352427)",
+        "X-IG-App-ID": "567067343352427",
+        "X-IG-Capabilities": "3brTvwE=",
+        "X-IG-Connection-Type": "WIFI",
+        "Accept-Language": "en-US",
+        "Accept": "*/*"
+    }
+
+    # Endpoint 1: Top live (discover page)
+    endpoints = [
+        "https://i.instagram.com/api/v1/discover/top_live/",
+        "https://i.instagram.com/api/v1/live/get_live_checklists/",
+        "https://i.instagram.com/api/v1/feed/reels_tray/"
+    ]
+
+    for endpoint in endpoints:
+        try:
+            resp = requests.get(endpoint, headers=headers, timeout=15)
+            logger.info(f"Discover {endpoint}: {resp.status_code}")
+            if resp.status_code != 200:
+                continue
+            data_json = resp.json()
+
+            # Parse ranked_items (top_live)
+            for item in data_json.get("ranked_items", []):
+                broadcast = item.get("broadcast") or item
+                user = broadcast.get("broadcast_owner") or item.get("user", {})
+                username = user.get("username", "")
+                if username and username not in seen:
+                    seen.add(username)
+                    lives.append({
+                        "username": username,
+                        "full_name": user.get("full_name", ""),
+                        "profile_pic": user.get("profile_pic_url", ""),
+                        "viewers": broadcast.get("viewer_count", 0),
+                        "thumbnail": broadcast.get("cover_frame_url", ""),
+                        "source": "top_live"
+                    })
+
+            # Parse items array
+            for item in data_json.get("items", []):
+                broadcast = item.get("broadcast")
+                if not broadcast: continue
+                user = item.get("user", {})
+                username = user.get("username", "")
+                if username and username not in seen:
+                    seen.add(username)
+                    lives.append({
+                        "username": username,
+                        "full_name": user.get("full_name", ""),
+                        "profile_pic": user.get("profile_pic_url", ""),
+                        "viewers": broadcast.get("viewer_count", 0),
+                        "thumbnail": broadcast.get("cover_frame_url", ""),
+                        "source": "items"
+                    })
+
+            # Parse tray (reels_tray)
+            for item in data_json.get("tray", []):
+                broadcast = item.get("broadcast")
+                if not broadcast: continue
+                user = item.get("user", {})
+                username = user.get("username", "")
+                if username and username not in seen:
+                    seen.add(username)
+                    lives.append({
+                        "username": username,
+                        "full_name": user.get("full_name", ""),
+                        "profile_pic": user.get("profile_pic_url", ""),
+                        "viewers": broadcast.get("viewer_count", 0),
+                        "thumbnail": broadcast.get("cover_frame_url", ""),
+                        "source": "reels_tray"
+                    })
+        except Exception as e:
+            logger.error(f"Discover error {endpoint}: {e}")
+
+    # Sort by viewer count
+    lives.sort(key=lambda x: x.get("viewers", 0), reverse=True)
+    return jsonify({"lives": lives, "count": len(lives)})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
