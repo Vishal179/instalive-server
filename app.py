@@ -957,6 +957,70 @@ def clear_graph():
     return jsonify({"status":"cleared"})
 
 
+
+@app.route("/graph/list")
+def graph_list():
+    """Get all tracked accounts with live status"""
+    page = int(request.args.get("page", 0))
+    per_page = int(request.args.get("per_page", 50))
+    search = request.args.get("search","").lower()
+
+    with graph_lock:
+        accounts = sorted(list(tracked_graph))
+
+    # Filter by search
+    if search:
+        accounts = [a for a in accounts if search in a.lower()]
+
+    total = len(accounts)
+    # Paginate
+    start = page * per_page
+    end = start + per_page
+    page_accounts = accounts[start:end]
+
+    # Mark which are live
+    with scan_lock:
+        live_set = set(live_cache.keys())
+
+    result = []
+    for uname in page_accounts:
+        is_live = uname in live_set
+        live_data = live_cache.get(uname, {})
+        result.append({
+            "username": uname,
+            "is_live": is_live,
+            "viewers": live_data.get("viewers", 0),
+            "thumbnail": live_data.get("thumbnail",""),
+            "profile_pic": live_data.get("profile_pic",""),
+        })
+
+    # Sort live first
+    result.sort(key=lambda x: (not x["is_live"], x["username"]))
+
+    return jsonify({
+        "accounts": result,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": (total + per_page - 1) // per_page,
+        "live_count": len(live_set)
+    })
+
+@app.route("/graph/remove", methods=["POST"])
+def graph_remove():
+    """Remove a username from tracking"""
+    data = request.json or {}
+    username = data.get("username","").strip()
+    if not username:
+        return jsonify({"error":"username required"}),400
+    with graph_lock:
+        tracked_graph.discard(username)
+    with scan_lock:
+        live_cache.pop(username, None)
+    save_graph()
+    return jsonify({"status":"removed","username":username})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
