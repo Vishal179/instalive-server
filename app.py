@@ -869,7 +869,7 @@ def auto_graph_scanner():
             build_follower_graph(cookie, depth=2)
             # Scan immediately after rebuild
             scan_graph_accounts()
-        time.sleep(1800)  # 30 minutes
+        time.sleep(scan_interval_seconds)
 
 # Start auto graph scanner
 graph_thread = threading.Thread(target=auto_graph_scanner, daemon=True)
@@ -929,6 +929,32 @@ def api_graph_add():
         added = len(tracked_graph) - before
     save_graph()
     return jsonify({"added": added, "total": len(tracked_graph)})
+
+
+
+scan_interval_seconds = 300  # Default 5 minutes
+
+@app.route("/scan/interval", methods=["POST"])
+def set_scan_interval():
+    global scan_interval_seconds
+    data = request.json or {}
+    minutes = int(data.get("interval_minutes", 5))
+    # Clamp between 1 min and 60 mins
+    minutes = max(1, min(60, minutes))
+    scan_interval_seconds = minutes * 60
+    logger.info(f"Scan interval set to {minutes} minutes")
+    return jsonify({"interval_minutes": minutes})
+
+@app.route("/graph/clear", methods=["POST"])
+def clear_graph():
+    global tracked_graph, live_cache
+    with graph_lock:
+        tracked_graph.clear()
+    with scan_lock:
+        live_cache.clear()
+    save_graph()
+    logger.info("Graph and live cache cleared")
+    return jsonify({"status":"cleared"})
 
 
 if __name__ == "__main__":
