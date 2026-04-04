@@ -624,6 +624,313 @@ def discover_brazil_lives():
     })
 
 
+
+# ── FOLLOWER GRAPH SCANNER ─────────────────────────────────
+# Builds a network of accounts to track dynamically
+tracked_graph = set()      # all discovered usernames
+graph_lock = threading.Lock()
+graph_file = "/tmp/graph.json"
+
+def save_graph():
+    try:
+        with graph_lock:
+            data = list(tracked_graph)
+        with open(graph_file,'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"save_graph: {e}")
+
+def load_graph():
+    global tracked_graph
+    try:
+        if os.path.exists(graph_file):
+            with open(graph_file,'r') as f:
+                data = json.load(f)
+            with graph_lock:
+                tracked_graph = set(data)
+            logger.info(f"Loaded graph: {len(tracked_graph)} accounts")
+    except Exception as e:
+        logger.error(f"load_graph: {e}")
+
+load_graph()
+
+def get_following(user_id, cookie, max_count=200):
+    """Get list of accounts a user follows"""
+    ua = "Instagram 269.0.0.18.75 Android (28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom; en_US; 567067343352427)"
+    following = []
+    next_max_id = ""
+    pages = 0
+    while pages < 4:  # Max 4 pages = ~200 accounts
+        try:
+            params = f"count=50"
+            if next_max_id:
+                params += f"&max_id={next_max_id}"
+            r = requests.get(
+                f"https://i.instagram.com/api/v1/friendships/{user_id}/following/?{params}",
+                headers={
+                    "Cookie": cookie,
+                    "User-Agent": ua,
+                    "X-IG-App-ID": "567067343352427",
+                },
+                timeout=15
+            )
+            if r.status_code != 200:
+                logger.warning(f"get_following {user_id}: {r.status_code}")
+                break
+            data = r.json()
+            users = data.get("users", [])
+            for u in users:
+                uname = u.get("username","")
+                if uname:
+                    following.append({
+                        "username": uname,
+                        "user_id": str(u.get("pk","")),
+                        "full_name": u.get("full_name",""),
+                        "profile_pic": u.get("profile_pic_url",""),
+                        "is_verified": u.get("is_verified", False),
+                    })
+            next_max_id = data.get("next_max_id","")
+            if not next_max_id or len(users) == 0:
+                break
+            pages += 1
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"get_following page {pages}: {e}")
+            break
+    return following
+
+def get_user_id_from_cookie(cookie):
+    """Get user ID of the logged in account"""
+    try:
+        ua = "Instagram 269.0.0.18.75 Android (28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom; en_US; 567067343352427)"
+        r = requests.get(
+            "https://i.instagram.com/api/v1/accounts/current_user/?edit=true",
+            headers={
+                "Cookie": cookie,
+                "User-Agent": ua,
+                "X-IG-App-ID": "567067343352427",
+            },
+            timeout=10
+        )
+        if r.status_code == 200:
+            user = r.json().get("user",{})
+            return str(user.get("pk","")), user.get("username","")
+    except Exception as e:
+        logger.error(f"get_user_id: {e}")
+    return None, None
+
+def build_follower_graph(cookie, depth=2):
+    """
+    Build follower graph:
+    depth=1: accounts you follow
+    depth=2: accounts your followings follow (2nd degree)
+    """
+    logger.info(f"Building follower graph depth={depth}")
+
+    # Step 1: Get my user ID
+    my_id, my_username = get_user_id_from_cookie(cookie)
+    if not my_id:
+        logger.error("Could not get user ID")
+        return
+
+    logger.info(f"Building graph for @{my_username}")
+
+    # Step 2: Get accounts I follow (depth 1)
+    my_following = get_following(my_id, cookie, max_count=200)
+    logger.info(f"You follow {len(my_following)} accounts")
+
+    new_accounts = set()
+    for u in my_following:
+        new_accounts.add(u["username"])
+
+    if depth >= 2:
+        # Step 3: For each account I follow, get their followings
+        for i, user in enumerate(my_following[:50]):  # Limit to 50 for speed
+            uid = user.get("user_id","")
+            uname = user.get("username","")
+            if not uid:
+                continue
+            try:
+                logger.info(f"Getting following of @{uname} ({i+1}/{min(50,len(my_following))})")
+                their_following = get_following(uid, cookie, max_count=50)
+                for u in their_following:
+                    new_accounts.add(u["username"])
+                time.sleep(1.5)  # Rate limit
+            except Exception as e:
+                logger.error(f"Graph depth2 @{uname}: {e}")
+
+    # Add all to tracked graph
+    with graph_lock:
+        before = len(tracked_graph)
+        tracked_graph.update(new_accounts)
+        added = len(tracked_graph) - before
+
+    save_graph()
+    logger.info(f"Graph built: {len(tracked_graph)} total accounts (+{added} new)")
+
+    # Trigger a live scan with new graph
+    if registered_accounts:
+        t = threading.Thread(
+            target=scan_graph_accounts,
+            daemon=True
+        )
+        t.start()
+
+def scan_graph_accounts():
+    """Scan all graph accounts for live status"""
+    with graph_lock:
+        accounts = list(tracked_graph)
+
+    if not accounts:
+        logger.warning("Graph empty, nothing to scan")
+        return
+
+    cookies = list(registered_accounts.keys())
+    if not cookies:
+        return
+
+    logger.info(f"Scanning {len(accounts)} graph accounts for live")
+    ua = "Instagram 269.0.0.18.75 Android (28/9; 420dpi; 1080x1920; samsung; SM-G998B; b0q; qcom; en_US; 567067343352427)"
+
+    cookie_idx = 0
+    found = 0
+
+    for username in accounts:
+        try:
+            cookie = cookies[cookie_idx % len(cookies)]
+            cookie_idx += 1
+
+            r = requests.get(
+                f"https://i.instagram.com/api/v1/users/{username}/usernameinfo/",
+                headers={
+                    "Cookie": cookie,
+                    "User-Agent": ua,
+                    "X-IG-App-ID": "567067343352427",
+                },
+                timeout=8
+            )
+
+            if r.status_code == 200:
+                user = r.json().get("user", {})
+                is_live = user.get("is_live", False)
+                if is_live:
+                    uid = user.get("pk","")
+                    viewers = 0
+                    thumbnail = ""
+                    if uid:
+                        try:
+                            r2 = requests.get(
+                                f"https://i.instagram.com/api/v1/feed/user/{uid}/story/",
+                                headers={
+                                    "Cookie": cookie,
+                                    "User-Agent": ua,
+                                    "X-IG-App-ID": "567067343352427",
+                                },
+                                timeout=8
+                            )
+                            if r2.status_code == 200:
+                                b = r2.json().get("broadcast",{})
+                                viewers = b.get("viewer_count",0)
+                                thumbnail = b.get("cover_frame_url","")
+                        except: pass
+
+                    with scan_lock:
+                        live_cache[username] = {
+                            "username": username,
+                            "full_name": user.get("full_name",""),
+                            "profile_pic": user.get("profile_pic_url",""),
+                            "viewers": viewers,
+                            "thumbnail": thumbnail,
+                            "timestamp": time.time(),
+                        }
+                    found += 1
+                    logger.info(f"LIVE @{username} viewers={viewers}")
+                else:
+                    with scan_lock:
+                        live_cache.pop(username, None)
+
+            elif r.status_code == 429:
+                logger.warning("Rate limited, sleeping 30s")
+                time.sleep(30)
+
+            time.sleep(0.5 + random.uniform(0, 0.3))
+
+        except Exception as e:
+            logger.error(f"scan @{username}: {e}")
+
+    logger.info(f"Graph scan done. Found {found} live")
+
+def auto_graph_scanner():
+    """Continuously rebuild graph and scan"""
+    while True:
+        if registered_accounts:
+            cookie = list(registered_accounts.keys())[0]
+            # Rebuild graph every 30 mins
+            build_follower_graph(cookie, depth=2)
+            # Scan immediately after rebuild
+            scan_graph_accounts()
+        time.sleep(1800)  # 30 minutes
+
+# Start auto graph scanner
+graph_thread = threading.Thread(target=auto_graph_scanner, daemon=True)
+graph_thread.start()
+
+@app.route("/graph/build", methods=["POST"])
+def api_build_graph():
+    """Manually trigger graph build"""
+    data = request.json or {}
+    cookie = data.get("cookie","")
+    if not cookie:
+        # Use registered cookie
+        if not registered_accounts:
+            return jsonify({"error":"No accounts registered"}), 400
+        cookie = list(registered_accounts.keys())[0]
+
+    depth = int(data.get("depth", 2))
+
+    t = threading.Thread(
+        target=build_follower_graph,
+        args=(cookie, depth),
+        daemon=True
+    )
+    t.start()
+
+    return jsonify({
+        "status": "building",
+        "message": f"Building follower graph depth={depth}",
+        "current_size": len(tracked_graph)
+    })
+
+@app.route("/graph/status")
+def api_graph_status():
+    with graph_lock:
+        size = len(tracked_graph)
+        sample = list(tracked_graph)[:10]
+    with scan_lock:
+        live_count = len(live_cache)
+    return jsonify({
+        "total_tracked": size,
+        "live_now": live_count,
+        "sample": sample,
+    })
+
+@app.route("/graph/add", methods=["POST"])
+def api_graph_add():
+    """Manually add usernames to track"""
+    data = request.json or {}
+    usernames = data.get("usernames", [])
+    if isinstance(usernames, str):
+        usernames = [u.strip() for u in usernames.split(",")]
+    with graph_lock:
+        before = len(tracked_graph)
+        for u in usernames:
+            if u.strip():
+                tracked_graph.add(u.strip().replace("@",""))
+        added = len(tracked_graph) - before
+    save_graph()
+    return jsonify({"added": added, "total": len(tracked_graph)})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
