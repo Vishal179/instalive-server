@@ -1021,6 +1021,208 @@ def graph_remove():
     return jsonify({"status":"removed","username":username})
 
 
+
+# Telegram MTProto via Telethon
+try:
+    from telethon.sync import TelegramClient
+    from telethon import functions, types
+    import asyncio
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+    logger.warning("Telethon not installed")
+
+tg_sessions = {}  # phone -> client session
+
+@app.route("/telegram/send_code", methods=["POST"])
+def tg_send_code():
+    if not TELETHON_AVAILABLE:
+        return jsonify({"ok":False,
+            "error":"pip install telethon on server"}),500
+    data = request.json or {}
+    phone = data.get("phone","")
+    api_id = int(data.get("api_id",0))
+    api_hash = data.get("api_hash","")
+    if not phone or not api_id or not api_hash:
+        return jsonify({"ok":False,"error":"Missing params"}),400
+    try:
+        import asyncio
+        async def send():
+            client = TelegramClient(
+                f"/tmp/tg_{phone.replace('+','')}",
+                api_id, api_hash)
+            await client.connect()
+            result = await client.send_code_request(phone)
+            tg_sessions[phone] = {
+                "client": client,
+                "hash": result.phone_code_hash
+            }
+            return result.phone_code_hash
+        loop = asyncio.new_event_loop()
+        phone_code_hash = loop.run_until_complete(send())
+        loop.close()
+        return jsonify({
+            "ok": True,
+            "phone_code_hash": phone_code_hash
+        })
+    except Exception as e:
+        logger.error(f"send_code: {e}")
+        return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/telegram/sign_in", methods=["POST"])
+def tg_sign_in():
+    if not TELETHON_AVAILABLE:
+        return jsonify({"ok":False,"error":"Telethon not installed"}),500
+    data = request.json or {}
+    phone = data.get("phone","")
+    code = data.get("code","")
+    phone_code_hash = data.get("phone_code_hash","")
+    api_id = int(data.get("api_id",0))
+    api_hash = data.get("api_hash","")
+    try:
+        import asyncio
+        async def signin():
+            if phone in tg_sessions:
+                client = tg_sessions[phone]["client"]
+                if not phone_code_hash:
+                    phone_code_hash_val = tg_sessions[phone]["hash"]
+                else:
+                    phone_code_hash_val = phone_code_hash
+            else:
+                client = TelegramClient(
+                    f"/tmp/tg_{phone.replace('+','')}",
+                    api_id, api_hash)
+                await client.connect()
+                phone_code_hash_val = phone_code_hash
+            await client.sign_in(phone, code,
+                phone_code_hash=phone_code_hash_val)
+            # Get session string
+            from telethon.sessions import StringSession
+            session = StringSession.save(client.session)
+            tg_sessions[phone] = {"client": client}
+            return session
+        loop = asyncio.new_event_loop()
+        session = loop.run_until_complete(signin())
+        loop.close()
+        return jsonify({"ok":True,"session":session})
+    except Exception as e:
+        logger.error(f"sign_in: {e}")
+        return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/telegram/get_live_chats", methods=["POST"])
+def tg_get_live_chats():
+    if not TELETHON_AVAILABLE:
+        return jsonify({"ok":False,"error":"Telethon not installed"}),500
+    data = request.json or {}
+    session = data.get("session","")
+    api_id = int(data.get("api_id",0))
+    api_hash = data.get("api_hash","")
+    if not session or not api_id:
+        return jsonify({"ok":False,"error":"Missing session"}),400
+    try:
+        import asyncio
+        async def get_chats():
+            from telethon.sessions import StringSession
+            client = TelegramClient(
+                StringSession(session), api_id, api_hash)
+            await client.connect()
+            dialogs = await client.get_dialogs()
+            live_chats = []
+            for d in dialogs:
+                if not hasattr(d.entity,"megagroup") and                    not hasattr(d.entity,"broadcast"):
+                    continue
+                # Check if video chat is active
+                try:
+                    full = await client(
+                        functions.channels.GetFullChannelRequest(
+                            d.entity))
+                    vc = full.full_chat.call
+                    if vc is not None:
+                        live_chats.append({
+                            "id": d.entity.id,
+                            "title": d.title,
+                            "username": getattr(
+                                d.entity,"username","") or "",
+                            "type": "channel" if getattr(
+                                d.entity,"broadcast",False)
+                                else "group",
+                            "is_live": True,
+                            "viewers": getattr(vc,
+                                "participants_count",0)
+                        })
+                    else:
+                        live_chats.append({
+                            "id": d.entity.id,
+                            "title": d.title,
+                            "username": getattr(
+                                d.entity,"username","") or "",
+                            "type": "channel" if getattr(
+                                d.entity,"broadcast",False)
+                                else "group",
+                            "is_live": False,
+                            "viewers": 0
+                        })
+                except Exception:
+                    pass
+            await client.disconnect()
+            return live_chats
+        loop = asyncio.new_event_loop()
+        chats = loop.run_until_complete(get_chats())
+        loop.close()
+        return jsonify({"ok":True,"chats":chats})
+    except Exception as e:
+        logger.error(f"get_live_chats: {e}")
+        return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/telegram/get_stream_url", methods=["POST"])
+def tg_get_stream_url():
+    if not TELETHON_AVAILABLE:
+        return jsonify({"ok":False,"error":"Telethon not installed"}),500
+    data = request.json or {}
+    session = data.get("session","")
+    api_id = int(data.get("api_id",0))
+    api_hash = data.get("api_hash","")
+    chat_id = int(data.get("chat_id",0))
+    if not session or not chat_id:
+        return jsonify({"ok":False,"error":"Missing params"}),400
+    try:
+        import asyncio
+        async def get_url():
+            from telethon.sessions import StringSession
+            client = TelegramClient(
+                StringSession(session), api_id, api_hash)
+            await client.connect()
+            entity = await client.get_entity(chat_id)
+            # Get stream channels
+            result = await client(
+                functions.phone.GetGroupCallStreamChannelsRequest(
+                    call=entity.call))
+            channels = result.channels
+            if not channels:
+                return None
+            # Get stream URL
+            # Telegram streams at dc.t.me/...
+            channel = channels[0]
+            # Get DC info
+            stream_url = (
+                f"https://dc{channel.last_timestamp_ms}.t.me/"+
+                f"{abs(chat_id)}/{channel.channel}/"+
+                f"{channel.last_timestamp_ms}/hls/index.m3u8")
+            await client.disconnect()
+            return stream_url
+        loop = asyncio.new_event_loop()
+        url = loop.run_until_complete(get_url())
+        loop.close()
+        if url:
+            return jsonify({"ok":True,"url":url})
+        else:
+            return jsonify({"ok":False,
+                "error":"No active stream"})
+    except Exception as e:
+        logger.error(f"get_stream_url: {e}")
+        return jsonify({"ok":False,"error":str(e)})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
